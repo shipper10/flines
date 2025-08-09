@@ -2,7 +2,7 @@
 import os
 import json
 import logging
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, List, Optional
 
 import requests
 from dotenv import load_dotenv
@@ -14,7 +14,9 @@ from telegram.ext import (
     CallbackQueryHandler,
 )
 
+# Load .env (optional on Koyeb if you use env vars)
 load_dotenv()
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("enka-bot")
 
@@ -41,85 +43,119 @@ def save_users(d: Dict[str, Dict[str, str]]) -> None:
         json.dump(d, f, ensure_ascii=False, indent=2)
 
 
-# mapping short command -> enka API path
+# short command -> enka API path
 GAME_ENDPOINTS = {
     "gen": "api/uid/{uid}",        # Genshin
     "hsr": "api/hsr/uid/{uid}",    # Honkai Star Rail
     "zzz": "api/zzz/uid/{uid}",    # Zenless Zone Zero
 }
 
-ENKA_BASE = "https://enka.network/"  # primary base - fallback handled in code
+ENKA_BASE = "https://enka.network"
 
 
 def build_enka_url(game: str, uid: str) -> str:
-    path_template = GAME_ENDPOINTS.get(game)
-    if not path_template:
+    if game not in GAME_ENDPOINTS:
         raise ValueError("Unsupported game")
-    return ENKA_BASE.rstrip("/") + "/" + path_template.format(uid=uid).lstrip("/")
+    path = GAME_ENDPOINTS[game].format(uid=uid)
+    return f"{ENKA_BASE.rstrip('/')}/{path.lstrip('/')}"
 
 
 def fetch_enka_data(game: str, uid: str, timeout: int = 10) -> Optional[Dict[str, Any]]:
-    """Fetch raw JSON from Enka API. Return dict or None on failure."""
     url = build_enka_url(game, uid)
     try:
-        resp = requests.get(url, timeout=timeout)
-        if resp.status_code != 200:
-            logger.warning("Enka returned status %s for %s", resp.status_code, url)
+        r = requests.get(url, timeout=timeout)
+        if r.status_code != 200:
+            logger.warning("Enka returned %s for %s", r.status_code, url)
             return None
-        return resp.json()
+        return r.json()
     except Exception as e:
-        logger.exception("Failed to fetch Enka data: %s", e)
+        logger.exception("Error fetching Enka data: %s", e)
         return None
 
 
 def extract_characters_from_response(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Try to find a list of characters in Enka API response.
-    Heuristics: keys like 'characters', 'avatars', 'player'->'characters', etc.
-    Returns list of dicts with at least 'name' (or 'avatar') and an 'id' if available.
+    Return list of character entries: each entry is dict with 'name' and 'raw' (the original object).
+    Try several known keys used by Enka API.
     """
     if not isinstance(data, dict):
         return []
-    # Common Enka format uses 'avatars' or 'characters'
+
+    # Known Enka response fields for Genshin: 'playerInfo' and 'avatarInfoList'
+    # For other games it might be 'avatars' or 'characters'
+    # Search common places:
+    # 1) avatarInfoList
+    if "avatarInfoList" in data and isinstance(data["avatarInfoList"], list):
+        out = []
+        for item in data["avatarInfoList"]:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name") or item.get("avatarName") or item.get("icon") or item.get("id") or "Unknown"
+            out.append({"name": str(name), "raw": item})
+        if out:
+            return out
+
+    # 2) try top-level keys
     for key in ("avatars", "characters", "data", "playerInfo", "player"):
         maybe = data.get(key)
         if isinstance(maybe, list) and maybe:
-            # each item might contain name / avatar info
             out = []
             for item in maybe:
                 if not isinstance(item, dict):
                     continue
-                # name field: several possibilities
-                name = item.get("name") or item.get("avatarName") or item.get("character") or item.get("icon", None)
-                # fallback to any recognizable field
-                if not name:
-                    # try nested info
-                    name = item.get("prop", {}).get("name") if isinstance(item.get("prop"), dict) else None
-                out.append({"name": str(name) if name is not None else "Unknown", "raw": item})
+                name = item.get("name") or item.get("avatarName") or item.get("character") or item.get("icon") or "Unknown"
+                out.append({"name": str(name), "raw": item})
             if out:
                 return out
-    # fallback: look for nested 'player'->'showcase' etc
-    # final fallback: empty
+
+    # 3) sometimes nested inside 'player' or others
+    # try to search recursively for a list of dicts that contain 'name' or 'avatarId'
+    def search_for_list(d):
+        if isinstance(d, list):
+            # detect if this list looks like characters
+            candidates = []
+            for el in d:
+                if isinstance(el, dict):
+                    if any(k in el for k in ("name", "avatarName", "icon", "id", "avatarId", "character")):
+                        candidates.append(el)
+            if candidates:
+                return candidates
+        elif isinstance(d, dict):
+            for v in d.values():
+                res = search_for_list(v)
+                if res:
+                    return res
+        return None
+
+    found = search_for_list(data)
+    if found:
+        out = []
+        for item in found:
+            name = item.get("name") or item.get("avatarName") or item.get("icon") or "Unknown"
+            out.append({"name": str(name), "raw": item})
+        if out:
+            return out
+
     return []
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "مرحبًا! هذه الأوامر المدعومة:\n"
-        "/set <game> <uid> — احفظ UID لحسابك (game: gen | hsr | zzz)\n"
+        "مرحبًا! أوامر البوت:\n"
+        "/set <game> <uid> — حفظ UID (game: gen | hsr | zzz)\n"
         "/account — عرض الحسابات المحفوظة\n"
-        "/gen — Genshin (اكتب /gen للحصول على قائمة الشخصيات)\n"
-        "/hsr — Honkai Star Rail\n"
+        "/gen — Genshin\n"
+        "/hsr — Honkai: Star Rail\n"
         "/zzz — Zenless Zone Zero\n\n"
         "مثال: /set gen 700000001\n"
-        "بعد حفظ UID، اكتب /gen ثم اختر شخصية من الأزرار."
+        "بعد حفظ UID اكتب /gen لعرض شخصياتك (زر لاختيار الشخصية سيظهر)."
     )
 
 
 async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) != 2:
-        await update.message.reply_text("❌ الصيغة: /set <game> <uid>  — مثال: /set gen 700000001")
+        await update.message.reply_text("❌ الصيغة: /set <game> <uid> — مثال: /set gen 700000001")
         return
     game = args[0].lower()
     uid = args[1].strip()
@@ -128,8 +164,7 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     users = load_users()
     key = str(update.effective_user.id)
-    users.setdefault(key, {})
-    users[key][game] = uid
+    users.setdefault(key, {})[game] = uid
     save_users(users)
     await update.message.reply_text(f"✅ تم حفظ UID للحساب ({game}): {uid}")
 
@@ -141,25 +176,18 @@ async def cmd_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not u:
         await update.message.reply_text("ℹ️ لا توجد حسابات محفوظة. استخدم /set <game> <uid>")
         return
-    lines = []
-    for g, uid in u.items():
-        lines.append(f"{g}: {uid}")
+    lines = [f"{g}: {uid}" for g, uid in u.items()]
     await update.message.reply_text("حساباتك المحفوظة:\n" + "\n".join(lines))
 
 
 async def cmd_game_generic(update: Update, context: ContextTypes.DEFAULT_TYPE, game: str):
-    """
-    Common handler for /gen, /hsr, /zzz
-    If args provided (character name), try to show that character immediately.
-    Otherwise list characters as inline buttons.
-    """
     users = load_users()
     key = str(update.effective_user.id)
     u = users.get(key, {})
     uid = u.get(game)
-    # allow: /gen <uid> to set on the fly (convenience)
+
+    # allow: /gen <uid> to set on the fly
     if not uid and context.args:
-        # if first arg is numeric, treat as uid set+proceed
         first = context.args[0]
         if first.isdigit():
             uid = first
@@ -167,7 +195,6 @@ async def cmd_game_generic(update: Update, context: ContextTypes.DEFAULT_TYPE, g
             save_users(users)
             await update.message.reply_text(f"✅ حفظت UID {uid} لحساب {game}.")
         else:
-            # if user typed a character name but no UID saved:
             await update.message.reply_text("❌ لم تحفظ UID بعد. استخدم /set <game> <uid> أو أرسل UID بعد الأمر.")
             return
 
@@ -175,76 +202,79 @@ async def cmd_game_generic(update: Update, context: ContextTypes.DEFAULT_TYPE, g
         await update.message.reply_text("❌ لم تحفظ UID بعد. استخدم /set <game> <uid> أو أعطِ UID مباشرة بعد الأمر.")
         return
 
-    # fetch data
+    # fetch
     await update.message.reply_text("⏳ جلب البيانات من Enka... انتظر لحظة.")
     data = fetch_enka_data(game, uid)
     if not data:
-        await update.message.reply_text("❌ فشل في جلب البيانات من Enka. قد تكون الخدمة معطّلة أو UID غير صحيح.")
+        await update.message.reply_text(
+            "❌ فشل في جلب البيانات من Enka. تحقق من الـ UID أو أعد المحاولة لاحقًا."
+        )
         return
 
     chars = extract_characters_from_response(data)
     if not chars:
-        await update.message.reply_text("ℹ️ لم يتم العثور على شخصيات في هذا الحساب (أو تنسيق الرد غير متوقع).")
+        # More specific checks: maybe response exists but no avatar list
+        # Helpful message with action steps
+        msg = (
+            "ℹ️ لم أجد شخصيات في هذا الحساب.\n\n"
+            "التحقّق خطوة بخطوة:\n"
+            "1) تأكد أن الـ UID صحيح.\n"
+            "2) افتح اللعبة وانتقل للـ Profile > Showcase، ضع الشخصيات التي تريد عرضها.\n"
+            "3) في إعدادات الخصوصية فعّل 'Show Character Details' أو ما يماثلها.\n"
+            "4) أعد تشغيل اللعبة أو انتظر 5-10 دقائق ثم جرّب مرة أخرى.\n\n"
+            "إذا كنت متأكدًا أن كل شيء مفعل وما زالت المشكلة مستمرة، أرسل لي الـ UID هنا لأتأكد منه."
+        )
+        await update.message.reply_text(msg)
         return
 
-    # if user provided a character name as argument, try to match and show directly
+    # If user passed a character name as argument try to match immediately
     if context.args:
         name_query = " ".join(context.args).strip().lower()
-        # if first arg was UID we already handled; now match by name
-        for ch in chars:
+        for i, ch in enumerate(chars):
             if name_query == str(ch.get("name", "")).strip().lower():
-                # show details
                 await show_character_details(update, context, game, uid, ch)
                 return
-        # not found -> continue to listing
-        await update.message.reply_text("ℹ️ لم أجد شخصية بنفس الاسم ـ سأعرض لك القائمة لاختيار واحد منها.")
+        # not found, continue to list
 
-    # build inline keyboard of character names (max per row 2)
+    # build inline keyboard
     keyboard = []
-    for ch in chars:
+    for i, ch in enumerate(chars):
         name = ch.get("name", "Unknown")
-        # callback_data: game|uid|index (index to find raw later)
-        idx = chars.index(ch)
-        cb = f"enkact|{game}|{uid}|{idx}"
+        cb = f"enk|{game}|{uid}|{i}"
         keyboard.append([InlineKeyboardButton(text=name, callback_data=cb)])
-
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("اختر شخصية:", reply_markup=reply_markup)
 
 
 async def show_character_details(update_or_query, context, game: str, uid: str, char_entry: Dict[str, Any]):
-    """
-    Send a message with character details. char_entry is from extract_characters_from_response (with 'raw').
-    update_or_query may be Update (message) or CallbackQuery.
-    """
-    # get raw data
     raw = char_entry.get("raw", {}) if isinstance(char_entry, dict) else {}
-    # Try to extract useful fields
     name = char_entry.get("name") or raw.get("name") or raw.get("avatarName") or "Unknown"
+    # level heuristics
     level = raw.get("level") or raw.get("rarity") or raw.get("fetter") or raw.get("levelText") or "?"
-    # attack stats or power may be present
-    info_lines = [f"🔸 الاسم: {name}", f"🔸 مستوى / مستوى تقدّم: {level}"]
-    # Add some more details when available
-    if isinstance(raw.get("weapon"), dict):
-        w = raw["weapon"]
-        info_lines.append(f"⚔️ سلاح: {w.get('name') or w.get('icon') or 'N/A'}")
-    # artifacts / relics - heuristic keys
-    artifacts = raw.get("reliquaries") or raw.get("artifacts") or raw.get("relics")
-    if isinstance(artifacts, list) and artifacts:
-        info_lines.append(f"🛡️ مجموعات آثار: {len(artifacts)}")
-    # image
+    info_lines = [f"🔸 الاسم: {name}", f"🔸 مستوى / تقدّم: {level}"]
+
+    # weapon
+    weapon = raw.get("weapon") or raw.get("equipment") or {}
+    if isinstance(weapon, dict) and (weapon.get("name") or weapon.get("icon")):
+        info_lines.append(f"⚔️ سلاح: {weapon.get('name') or weapon.get('icon')}")
+
+    # artifacts / reliquaries
+    relics = raw.get("reliquaries") or raw.get("artifacts") or raw.get("relics")
+    if isinstance(relics, list) and relics:
+        info_lines.append(f"🛡️ آثار: {len(relics)} قطع")
+
+    # image heuristics
     image_url = None
-    # common Enka fields for images
-    if isinstance(raw.get("icon"), str) and raw.get("icon").startswith("http"):
-        image_url = raw.get("icon")
-    elif isinstance(raw.get("avatarIcon"), str) and raw.get("avatarIcon").startswith("http"):
-        image_url = raw.get("avatarIcon")
-    elif isinstance(raw.get("image"), str) and raw.get("image").startswith("http"):
-        image_url = raw.get("image")
+    for k in ("icon", "avatarIcon", "image", "avatarIconUrl", "iconUrl"):
+        v = raw.get(k)
+        if isinstance(v, str) and v.startswith("http"):
+            image_url = v
+            break
+
     text = "\n".join(info_lines)
 
-    # send either as answer to callback query or new message
-    if hasattr(update_or_query, "answer"):  # it's a CallbackQuery
+    # send response (handle both CallbackQuery and Message)
+    if hasattr(update_or_query, "answer"):  # callback query
         cq = update_or_query
         try:
             await cq.answer()
@@ -256,7 +286,6 @@ async def show_character_details(update_or_query, context, game: str, uid: str, 
         else:
             await context.bot.send_message(chat_id=chat, text=text)
     else:
-        # regular update (message)
         upd = update_or_query
         if image_url:
             await upd.message.reply_photo(photo=image_url, caption=text)
@@ -269,8 +298,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query or not query.data:
         return
     data = query.data
-    # Our callback_data format: enkact|game|uid|index
-    if not data.startswith("enkact|"):
+    if not data.startswith("enk|"):
         await query.answer()
         return
     try:
@@ -280,11 +308,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("خطأ في البيانات.")
         return
 
-    # fetch enka data and extract again
     enka = fetch_enka_data(game, uid)
     if not enka:
         await query.answer("فشل في جلب بيانات Enka.")
         return
+
     chars = extract_characters_from_response(enka)
     if idx < 0 or idx >= len(chars):
         await query.answer("خيار غير صالح.")
@@ -298,7 +326,7 @@ def register_handlers(app):
     app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("account", cmd_account))
 
-    # game handlers
+    # game commands
     app.add_handler(CommandHandler("gen", lambda u, c: cmd_game_generic(u, c, "gen")))
     app.add_handler(CommandHandler("hsr", lambda u, c: cmd_game_generic(u, c, "hsr")))
     app.add_handler(CommandHandler("zzz", lambda u, c: cmd_game_generic(u, c, "zzz")))
