@@ -1,5 +1,2 @@
-python-telegram-bot==20.3
-Flask==3.0.3
-genshin==1.7.16
-ramael
-python-dotenv
+python-telegram-bot>=20.0
+requests>=2.28
