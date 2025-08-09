@@ -7,7 +7,7 @@
     "start": "node bot.js"
   },
   "dependencies": {
-    "node-hoyolab": "^1.0.6",
+    "node-hoyolab": "^2.0.2",
     "node-telegram-bot-api": "^0.61.0",
     "fs-extra": "^11.2.0"
   },
