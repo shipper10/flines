@@ -62,7 +62,7 @@ def build_enka_url(game: str, uid: str) -> str:
     return f"{ENKA_BASE.rstrip('/')}/{path.lstrip('/')}"
 
 def fetch_enka_data_sync(game: str, uid: str, timeout: int = 30, retries: int = 3, backoff: float = 1.5) -> Optional[Dict[str, Any]]:
-    \"\"\"Blocking synchronous fetch with retries. Designed to be called inside asyncio.to_thread.\"\"\"
+    """Blocking synchronous fetch with retries. Designed to be called inside asyncio.to_thread."""
     url = build_enka_url(game, uid)
     for attempt in range(1, retries + 1):
         try:
