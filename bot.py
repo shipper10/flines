@@ -4,6 +4,7 @@ import json
 import threading
 import traceback
 import logging
+import imghdr2 as imghdr
 from typing import Any, Dict, List, Optional
 
 from flask import Flask
