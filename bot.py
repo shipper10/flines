@@ -1,7 +1,6 @@
 # bot.py
 import os
 import json
-import asyncio
 import threading
 import traceback
 import logging
@@ -360,8 +359,8 @@ async def cmd_check_in(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ℹ️ مكتبتك لا تدعم المطالبة التلقائية.")
 
 
-# ----- Bot runner (async) -----
-async def run_bot_async():
+# ----- Bot runner (synchronous run_polling) -----
+def run_bot():
     logger.info("Building telegram Application...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -383,9 +382,9 @@ async def run_bot_async():
     app.add_handler(CommandHandler("daily", cmd_daily))
     app.add_handler(CommandHandler("check_in", cmd_check_in))
 
-    logger.info("Starting polling...")
-    # run_polling is a coroutine-friendly blocking call
-    await app.run_polling()
+    logger.info("Starting polling (this call manages asyncio loop internally)...")
+    # run_polling is a blocking call that manages the asyncio loop internally
+    app.run_polling()
 
 
 # ----- Flask health server -----
@@ -403,13 +402,13 @@ def run_flask():
     server.run(host="0.0.0.0", port=PORT)
 
 
-# ----- Main: start Flask thread then asyncio loop for bot -----
+# ----- Main: start Flask thread then run_polling in main thread -----
 def main():
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
     try:
-        asyncio.run(run_bot_async())
+        run_bot()
     except Exception:
         logger.error("Bot crashed:\n" + traceback.format_exc())
 
