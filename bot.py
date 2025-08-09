@@ -5,140 +5,106 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# تحميل المتغيرات من .env
+# تحميل المتغيرات من .env في الوضع المحلي
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# ملف تخزين بيانات المستخدمين
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATA_FILE = "users.json"
 
-# تحميل أو إنشاء ملف المستخدمين
-if not os.path.exists(DATA_FILE):
-    with open(DATA_FILE, "w") as f:
-        json.dump({}, f)
-
-def load_users():
+# تحميل بيانات المستخدمين
+if os.path.exists(DATA_FILE):
     with open(DATA_FILE, "r") as f:
-        return json.load(f)
+        users = json.load(f)
+else:
+    users = {}
 
-def save_users(data):
+# حفظ البيانات
+def save_users():
     with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+        json.dump(users, f)
 
-# أمر /start
+# أمر بدء البوت
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 مرحبًا! أنا بوت Genshin Impact.\n"
-        "اربط حسابك باستخدام:\n"
-        "`/link ltuid ltoken`\n"
-        "ثم سجل UID الخاص بك بـ `/setuid UID`",
-        parse_mode="Markdown"
+        "أهلاً! أنا بوت Genshin.\n"
+        "استخدم /link لربط حسابك.\n"
+        "أوامر أخرى:\n"
+        "/resin - عرض الريزن\n"
+        "/abyss - عرض Spiral Abyss\n"
+        "/stygian - عرض Stygian Onslaught\n"
+        "/lobby - عرض Theater Lobby"
     )
 
-# أمر /link لربط الحساب
-async def link_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users = load_users()
-    args = context.args
-    if len(args) != 2:
-        await update.message.reply_text("❌ الصيغة الصحيحة: `/link ltuid ltoken`", parse_mode="Markdown")
+# ربط الحساب (Token HoYoLAB)
+async def link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) != 1:
+        await update.message.reply_text("❌ أرسل التوكين فقط مثل:\n/link your_cookie_token")
         return
-    ltuid, ltoken = args
-    user_id = str(update.effective_user.id)
-    if user_id not in users:
-        users[user_id] = {}
-    users[user_id]["ltuid"] = ltuid
-    users[user_id]["ltoken"] = ltoken
-    save_users(users)
-    await update.message.reply_text("✅ تم ربط حسابك بنجاح!")
 
-# أمر /setuid
+    cookie_token = context.args[0]
+    user_id = str(update.effective_user.id)
+    users[user_id] = {"cookie_token": cookie_token, "uid": None}
+    save_users()
+    await update.message.reply_text("✅ تم حفظ التوكين الخاص بك.")
+
+# حفظ UID
 async def set_uid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users = load_users()
-    args = context.args
-    if len(args) != 1:
-        await update.message.reply_text("❌ الصيغة الصحيحة: `/setuid UID`", parse_mode="Markdown")
+    if len(context.args) != 1:
+        await update.message.reply_text("❌ أرسل UID مثل:\n/setuid 700000000")
         return
-    uid = args[0]
+
+    uid = context.args[0]
     user_id = str(update.effective_user.id)
     if user_id not in users:
-        users[user_id] = {}
+        await update.message.reply_text("❌ اربط التوكين أولاً باستخدام /link")
+        return
+
     users[user_id]["uid"] = uid
-    save_users(users)
-    await update.message.reply_text(f"✅ تم حفظ UID الخاص بك: {uid}")
+    save_users()
+    await update.message.reply_text(f"✅ تم حفظ UID: {uid}")
 
-# أمر /resin
-async def get_resin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users = load_users()
+# عرض الريزن
+async def resin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    if user_id not in users or "ltuid" not in users[user_id] or "ltoken" not in users[user_id]:
-        await update.message.reply_text("⚠️ لم تربط حسابك بعد.\nاستخدم `/link ltuid ltoken`", parse_mode="Markdown")
+    if user_id not in users or not users[user_id]["uid"]:
+        await update.message.reply_text("❌ اربط التوكين و UID أولاً.")
         return
-    creds = users[user_id]
-    client = genshin.Client({"ltuid": creds["ltuid"], "ltoken": creds["ltoken"]})
-    try:
-        notes = await client.get_genshin_notes(uid=users[user_id]["uid"])
-        await update.message.reply_text(f"🔋 لديك {notes.current_resin}/{notes.max_resin} Resin")
-    except Exception as e:
-        await update.message.reply_text(f"❌ حدث خطأ: {e}")
 
-# أمر /abyss
+    client = genshin.Client({"cookie_token": users[user_id]["cookie_token"]})
+    data = await client.get_notes(uid=users[user_id]["uid"])
+    await update.message.reply_text(f"🔋 Resin: {data.current_resin}/{data.max_resin}")
+
+# Spiral Abyss
 async def abyss(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users = load_users()
     user_id = str(update.effective_user.id)
-    if user_id not in users or "ltuid" not in users[user_id] or "ltoken" not in users[user_id] or "uid" not in users[user_id]:
-        await update.message.reply_text("⚠️ تأكد أنك ربطت حسابك وأضفت UID.")
+    if user_id not in users or not users[user_id]["uid"]:
+        await update.message.reply_text("❌ اربط التوكين و UID أولاً.")
         return
-    creds = users[user_id]
-    client = genshin.Client({"ltuid": creds["ltuid"], "ltoken": creds["ltoken"]})
-    try:
-        data = await client.get_spiral_abyss(users[user_id]["uid"])
-        await update.message.reply_text(
-            f"🌀 Spiral Abyss:\nStars: {data.total_stars}\nFloors: {len(data.floors)}"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ حدث خطأ: {e}")
 
-# أمر /stygian
+    client = genshin.Client({"cookie_token": users[user_id]["cookie_token"]})
+    data = await client.get_spiral_abyss(uid=users[user_id]["uid"])
+    await update.message.reply_text(f"🏰 Spiral Abyss:\nFloors: {data.max_floor}\nStars: {data.total_stars}")
+
+# Stygian Onslaught
 async def stygian(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users = load_users()
-    user_id = str(update.effective_user.id)
-    if user_id not in users or "ltuid" not in users[user_id] or "ltoken" not in users[user_id] or "uid" not in users[user_id]:
-        await update.message.reply_text("⚠️ تأكد أنك ربطت حسابك وأضفت UID.")
-        return
-    creds = users[user_id]
-    client = genshin.Client({"ltuid": creds["ltuid"], "ltoken": creds["ltoken"]})
-    try:
-        data = await client.get_stygian(users[user_id]["uid"])
-        await update.message.reply_text(f"⚔️ Stygian Onslaught: {data}")
-    except Exception as e:
-        await update.message.reply_text(f"❌ حدث خطأ: {e}")
+    await update.message.reply_text("⚔ بيانات Stygian Onslaught ستتم إضافتها لاحقًا.")
 
-# أمر /lobby
+# Theater Lobby
 async def lobby(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users = load_users()
-    user_id = str(update.effective_user.id)
-    if user_id not in users or "ltuid" not in users[user_id] or "ltoken" not in users[user_id] or "uid" not in users[user_id]:
-        await update.message.reply_text("⚠️ تأكد أنك ربطت حسابك وأضفت UID.")
-        return
-    creds = users[user_id]
-    client = genshin.Client({"ltuid": creds["ltuid"], "ltoken": creds["ltoken"]})
-    try:
-        data = await client.get_theater(users[user_id]["uid"])
-        await update.message.reply_text(f"🎭 Theater Lobby: {data}")
-    except Exception as e:
-        await update.message.reply_text(f"❌ حدث خطأ: {e}")
+    await update.message.reply_text("🎭 بيانات Theater Lobby ستتم إضافتها لاحقًا.")
 
 # تشغيل البوت
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("link", link_account))
+    app.add_handler(CommandHandler("link", link))
     app.add_handler(CommandHandler("setuid", set_uid))
-    app.add_handler(CommandHandler("resin", get_resin))
+    app.add_handler(CommandHandler("resin", resin))
     app.add_handler(CommandHandler("abyss", abyss))
     app.add_handler(CommandHandler("stygian", stygian))
     app.add_handler(CommandHandler("lobby", lobby))
-    print("🚀 البوت يعمل الآن...")
+
     app.run_polling()
 
 if __name__ == "__main__":
