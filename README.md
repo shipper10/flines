@@ -1,13 +1,19 @@
-# flines - Telegram HoYoLab Bot
+# Genshin Impact Telegram Bot
 
-Quick start:
+بوت تيليجرام لعرض بيانات Genshin Impact من HoYoLAB.
 
-1. Set BOT_TOKEN environment variable (in Koyeb use Environment Variables).
-2. Install locally: `npm install`
-3. Run: `BOT_TOKEN=xxx npm start`
+## الأوامر
+- `/start` — شرح البوت
+- `/link ltuid ltoken` — ربط الحساب
+- `/setuid UID` — حفظ UID
+- `/resin` — عرض Resin
+- `/abyss` — عرض Spiral Abyss
+- `/stygian` — عرض Stygian Onslaught
+- `/lobby` — عرض Theater Lobby
 
-Deploy on Koyeb:
-- Push repository to GitHub.
-- In Koyeb create new app and connect the repo.
-- Set Environment variable BOT_TOKEN with your bot token.
-- Deploy (Koyeb will run `npm ci` using package-lock.json).
+## التشغيل على Koyeb
+1. ارفع المشروع على GitHub
+2. اربطه مع Koyeb واختر Python
+3. أضف متغير البيئة:
+   - `BOT_TOKEN` = التوكن من BotFather
+4. شغل التطبيق
