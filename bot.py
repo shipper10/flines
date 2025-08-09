@@ -1,31 +1,32 @@
 # bot.py
 import os
 import json
+import asyncio
 import threading
 import traceback
 import logging
-import imghdr
 from typing import Any, Dict, List, Optional
 
 from flask import Flask
+from dotenv import load_dotenv
+
+# telegram imports (v20+)
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 import genshin
-from dotenv import load_dotenv
 
 load_dotenv()
 
-# ===== Logging =====
+# ----- Config & Logging -----
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("genshin-bot")
 
-# ===== Config =====
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise SystemExit("Missing BOT_TOKEN environment variable")
 
-PORT = int(os.environ.get("PORT", 8080))
+PORT = int(os.environ.get("PORT", 8000))
 DATA_FILE = "users.json"
 
 # Ensure users file exists
@@ -34,7 +35,7 @@ if not os.path.exists(DATA_FILE):
         json.dump({}, f, ensure_ascii=False, indent=2)
 
 
-# ===== Helpers: load/save users =====
+# ----- helpers: load/save users -----
 def load_users() -> Dict[str, Dict[str, Any]]:
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -43,16 +44,16 @@ def load_users() -> Dict[str, Dict[str, Any]]:
         return {}
 
 
-def save_users(users: Dict[str, Dict[str, Any]]):
+def save_users(users: Dict[str, Dict[str, Any]]) -> None:
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(users, f, ensure_ascii=False, indent=2)
 
 
-# ===== Helper: create genshin client (flexible) =====
-def make_genshin_client(creds: Dict[str, Any], uid: Optional[str] = None):
+# ----- helper: create genshin client (flexible) -----
+def make_genshin_client(creds: Dict[str, Any], uid: Optional[str] = None) -> genshin.Client:
     """
     creds may include ltuid+ltoken OR cookie_token.
-    Returns genshin.Client instance (may raise).
+    Try different constructor signatures for genshin.Client.
     """
     cookies = None
     if creds.get("ltuid") and creds.get("ltoken"):
@@ -60,15 +61,14 @@ def make_genshin_client(creds: Dict[str, Any], uid: Optional[str] = None):
     elif creds.get("cookie_token"):
         cookies = {"cookie_token": creds["cookie_token"]}
     else:
-        raise ValueError("No credentials stored for this user.")
+        raise ValueError("No stored credentials for this user.")
 
-    # try different constructor patterns
     try:
         if uid:
             return genshin.Client(cookies, uid=int(uid))
         return genshin.Client(cookies)
     except TypeError:
-        # some versions accept kwargs differently
+        # fallback: different kwarg style
         try:
             if uid:
                 return genshin.Client(cookies=cookies, uid=int(uid))
@@ -77,17 +77,20 @@ def make_genshin_client(creds: Dict[str, Any], uid: Optional[str] = None):
         return genshin.Client(cookies)
 
 
-# ===== Helper: try multiple function names on client =====
+# ----- helper: try multiple async call names -----
 async def try_calls(obj: Any, names: List[str], *args, **kwargs):
+    """
+    Try several coroutine attribute names on obj and return first success result.
+    If none work, raise last exception.
+    """
     last_exc = None
     for name in names:
         fn = getattr(obj, name, None)
         if callable(fn):
             try:
                 return await fn(*args, **kwargs)
-            except TypeError as te:
-                # try without those args (fallback)
-                last_exc = te
+            except TypeError:
+                # try without args if TypeError (many genshin.py signatures differ)
                 try:
                     return await fn()
                 except Exception as e2:
@@ -98,31 +101,33 @@ async def try_calls(obj: Any, names: List[str], *args, **kwargs):
                 continue
     if last_exc:
         raise last_exc
-    raise RuntimeError(f"No function found among: {names}")
+    raise RuntimeError(f"No callable found among: {names}")
 
 
-# ===== Telegram command handlers =====
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ----- Telegram command handlers -----
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "مرحباً! بوت Genshin جاهز ✅\n\n"
-        "الأوامر:\n"
-        "/link <ltuid> <ltoken>  — ربط باستخدام ltuid & ltoken\n"
+        "مرحبًا! هذه الأوامر المدعومة (إن كانت مكتبتك تدعمها):\n\n"
+        "🔧 إعداد:\n"
+        "/link <ltuid> <ltoken> — ربط باستخدام ltuid & ltoken\n"
         "/link_cookie <cookie_token> — ربط باستخدام cookie_token\n"
-        "/unlink — إلغاء الربط\n\n"
-        "🔹 حساب:\n"
+        "/unlink — حذف الربط\n\n"
+        "📊 الحساب:\n"
         "/stats — إحصائيات الحساب\n"
         "/characters — قائمة الشخصيات\n"
-        "/diary — Traveler's Diary (الملاحظات)\n"
-        "/transactions — آخر المعاملات (إن توفرت)\n\n"
-        "🔹 الأحداث والمعارك:\n"
+        "/notes — Resin و Expedition وغيرها\n"
+        "/transactions — آخر المعاملات\n\n"
+        "🌀 الابيس:\n"
         "/abyss — Spiral Abyss الحالي\n"
-        "/previous_abyss — Spiral Abyss السابق (إن دعمته المكتبة)\n\n"
-        "🔹 المكافآت اليومية:\n"
-        "/daily — طلب بيانات المكافآت اليومية (إن توفرت)\n"
-        "/check_in — تحقق/مطالبة يومية (إن دعمت المكتبة)\n"
+        "/previous_abyss — Spiral Abyss السابق (إن توفّر)\n\n"
+        "📅 يومي:\n"
+        "/daily — بيانات المكافآت اليومية (إن توفّر)\n"
+        "/check_in — محاولة المطالبة اليومية (إن تدعم المكتبة)\n\n"
+        "/help — هذه الرسالة"
     )
 
 
+# ---- link/unlink ----
 async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) != 2:
@@ -130,10 +135,10 @@ async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     ltuid, ltoken = args
     users = load_users()
-    uid_str = str(update.effective_user.id)
-    users.setdefault(uid_str, {})
-    users[uid_str]["ltuid"] = ltuid
-    users[uid_str]["ltoken"] = ltoken
+    key = str(update.effective_user.id)
+    users.setdefault(key, {})
+    users[key]["ltuid"] = ltuid
+    users[key]["ltoken"] = ltoken
     save_users(users)
     await update.message.reply_text("✅ تم حفظ ltuid و ltoken.")
 
@@ -145,70 +150,65 @@ async def cmd_link_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     cookie = args[0]
     users = load_users()
-    uid_str = str(update.effective_user.id)
-    users.setdefault(uid_str, {})
-    users[uid_str]["cookie_token"] = cookie
+    key = str(update.effective_user.id)
+    users.setdefault(key, {})
+    users[key]["cookie_token"] = cookie
     save_users(users)
     await update.message.reply_text("✅ تم حفظ cookie_token.")
 
 
 async def cmd_unlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = load_users()
-    uid_str = str(update.effective_user.id)
-    if uid_str in users:
-        users.pop(uid_str, None)
+    key = str(update.effective_user.id)
+    if key in users:
+        users.pop(key, None)
         save_users(users)
         await update.message.reply_text("✅ تم إلغاء الربط وحذف بياناتك محلياً.")
     else:
         await update.message.reply_text("ℹ️ لا يوجد حساب مربوط.")
 
 
-# ---- Account / basic info ----
+# ---- account / notes / characters / transactions ----
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = load_users()
-    uid_str = str(update.effective_user.id)
-    u = users.get(uid_str)
+    key = str(update.effective_user.id)
+    u = users.get(key)
     if not u:
         await update.message.reply_text("⚠️ لم تربط حسابك بعد. استخدم /link أو /link_cookie")
         return
     try:
         client = make_genshin_client(u, uid=u.get("uid"))
-        # try possible function names for user/stats
         user = await try_calls(client, ["get_genshin_user", "get_user", "get_user_data"])
-        # extract some common stats
         stats = getattr(user, "stats", None) or (user.get("stats") if isinstance(user, dict) else None)
         if stats:
             ar = getattr(stats, "adventure_rank", None) or stats.get("adventure_rank", None)
-            world_level = getattr(stats, "world_level", None) or stats.get("world_level", None)
-            num_chars = getattr(stats, "character_number", None) or stats.get("character_number", None) or "?"
-            await update.message.reply_text(f"🏷 Adventure Rank: {ar}\n🌍 World Level: {world_level}\n👥 Characters: {num_chars}")
+            wl = getattr(stats, "world_level", None) or stats.get("world_level", None)
+            chars = getattr(stats, "character_number", None) or stats.get("character_number", None) or "?"
+            await update.message.reply_text(f"🏷 Adventure Rank: {ar}\n🌍 World Level: {wl}\n👥 Characters: {chars}")
             return
-        # fallback: try to stringify some fields
         await update.message.reply_text(str(user))
     except Exception as e:
-        tb = traceback.format_exc()
-        logger.error(tb)
+        logger.error(traceback.format_exc())
         await update.message.reply_text(f"❌ فشل جلب الإحصائيات: {e}")
 
 
 async def cmd_characters(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = load_users()
-    uid_str = str(update.effective_user.id)
-    u = users.get(uid_str)
+    key = str(update.effective_user.id)
+    u = users.get(key)
     if not u:
         await update.message.reply_text("⚠️ لم تربط حسابك بعد.")
         return
     try:
         client = make_genshin_client(u, uid=u.get("uid"))
         data = await try_calls(client, ["get_characters", "get_genshin_user", "get_characters_list"])
-        # try to extract a list of characters
         chars = None
         if isinstance(data, dict):
             chars = data.get("avatars") or data.get("characters") or data.get("data")
         else:
             chars = getattr(data, "avatars", None) or getattr(data, "characters", None)
         if not chars:
-            await update.message.reply_text("ℹ️ لم أتمكن من استخراج قائمة الشخصيات من المكتبة هذه النسخة.")
+            await update.message.reply_text("ℹ️ لم أتمكن من استخراج قائمة الشخصيات من هذه النسخة من genshin.py.")
             return
         lines = []
         for c in chars[:30]:
@@ -221,45 +221,43 @@ async def cmd_characters(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ خطأ في جلب الشخصيات: {e}")
 
 
-async def cmd_diary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = load_users()
-    uid_str = str(update.effective_user.id)
-    u = users.get(uid_str)
+    key = str(update.effective_user.id)
+    u = users.get(key)
     if not u:
         await update.message.reply_text("⚠️ لم تربط حسابك بعد.")
         return
     try:
         client = make_genshin_client(u, uid=u.get("uid"))
         notes = await try_calls(client, ["get_notes", "get_genshin_notes", "get_daily_notes"])
-        # attempt to extract useful fields
         current_resin = getattr(notes, "current_resin", None) or (notes.get("current_resin") if isinstance(notes, dict) else None)
         max_resin = getattr(notes, "max_resin", None) or (notes.get("max_resin") if isinstance(notes, dict) else None)
-        resin_recovery = getattr(notes, "resin_recovery_time", None) or (notes.get("resin_recovery_time") if isinstance(notes, dict) else None)
+        expeditions = getattr(notes, "expeditions", None) or (notes.get("expeditions") if isinstance(notes, dict) else None)
         lines = []
         if current_resin is not None:
             lines.append(f"🔋 Resin: {current_resin}/{max_resin}")
-        if resin_recovery:
-            lines.append(f"⏳ Recovery: {resin_recovery}")
+        if expeditions:
+            lines.append(f"🚩 Expeditions: {len(expeditions)} active")
         if lines:
             await update.message.reply_text("\n".join(lines))
             return
         await update.message.reply_text(str(notes))
     except Exception as e:
         logger.error(traceback.format_exc())
-        await update.message.reply_text(f"❌ خطأ في جلب الملاحظات/الـ Diary: {e}")
+        await update.message.reply_text(f"❌ خطأ في جلب الملاحظات: {e}")
 
 
 async def cmd_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = load_users()
-    uid_str = str(update.effective_user.id)
-    u = users.get(uid_str)
+    key = str(update.effective_user.id)
+    u = users.get(key)
     if not u:
         await update.message.reply_text("⚠️ لم تربط حسابك بعد.")
         return
     try:
         client = make_genshin_client(u, uid=u.get("uid"))
         data = await try_calls(client, ["get_transactions", "get_transaction_history", "get_wallet_records"])
-        # try to show last few entries
         entries = None
         if isinstance(data, dict):
             entries = data.get("transactions") or data.get("items") or data.get("data")
@@ -281,25 +279,23 @@ async def cmd_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ خطأ في جلب المعاملات: {e}")
 
 
-# ---- Abyss commands ----
+# ---- Abyss ----
 async def cmd_abyss(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = load_users()
-    uid_str = str(update.effective_user.id)
-    u = users.get(uid_str)
+    key = str(update.effective_user.id)
+    u = users.get(key)
     if not u:
         await update.message.reply_text("⚠️ لم تربط حسابك بعد.")
         return
     try:
         client = make_genshin_client(u, uid=u.get("uid"))
         abyss = await try_calls(client, ["get_spiral_abyss", "get_abyss", "spiral_abyss"], u.get("uid"))
-        # try to extract main info
         total_stars = getattr(abyss, "total_stars", None) or (abyss.get("total_stars") if isinstance(abyss, dict) else None)
         floors = getattr(abyss, "floors", None) or (abyss.get("floors") if isinstance(abyss, dict) else None)
         lines = []
         if total_stars is not None:
             lines.append(f"⭐ إجمالي النجوم: {total_stars}")
         if floors:
-            # iterate floors
             try:
                 for f in floors:
                     idx = getattr(f, "index", None) or (f.get("index") if isinstance(f, dict) else "?")
@@ -317,8 +313,8 @@ async def cmd_abyss(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_prev_abyss(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = load_users()
-    uid_str = str(update.effective_user.id)
-    u = users.get(uid_str)
+    key = str(update.effective_user.id)
+    u = users.get(key)
     if not u:
         await update.message.reply_text("⚠️ لم تربط حسابك بعد.")
         return
@@ -328,15 +324,14 @@ async def cmd_prev_abyss(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(str(prev))
     except Exception as e:
         logger.error(traceback.format_exc())
-        await update.message.reply_text("ℹ️ لا تدعم مكتبتك هذه الوظيفة أو حدث خطأ عند الاستدعاء.")
+        await update.message.reply_text("ℹ️ هذه الوظيفة غير مدعومة في نسخة المكتبة أو حدث خطأ.")
 
 
 # ---- Daily / check-in (best-effort) ----
 async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔔 أمر /daily: تحقّق من دعم المكتبة. سأحاول جلب بيانات يومية إن كانت متاحة.")
     users = load_users()
-    uid_str = str(update.effective_user.id)
-    u = users.get(uid_str)
+    key = str(update.effective_user.id)
+    u = users.get(key)
     if not u:
         await update.message.reply_text("⚠️ لم تربط حسابك بعد.")
         return
@@ -346,14 +341,13 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(str(daily))
     except Exception as e:
         logger.error(traceback.format_exc())
-        await update.message.reply_text("ℹ️ هذه النسخة من المكتبة لا تدعم بيانات المكافآت اليومية.")
+        await update.message.reply_text("ℹ️ مكتبتك لا تدعم بيانات المكافآت اليومية.")
 
 
 async def cmd_check_in(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⚠️ الأمر /check_in يتم تنفيذه فقط إذا كانت مكتبتك تدعم المطالبة التلقائية — وإلا سيتم إظهار رسالة.")
     users = load_users()
-    uid_str = str(update.effective_user.id)
-    u = users.get(uid_str)
+    key = str(update.effective_user.id)
+    u = users.get(key)
     if not u:
         await update.message.reply_text("⚠️ لم تربط حسابك بعد.")
         return
@@ -363,23 +357,24 @@ async def cmd_check_in(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ نتيجة الطلب:\n{res}")
     except Exception as e:
         logger.error(traceback.format_exc())
-        await update.message.reply_text("ℹ️ مكتبتك لا تدعم المطالبة التلقائية أو حدث خطأ.")
+        await update.message.reply_text("ℹ️ مكتبتك لا تدعم المطالبة التلقائية.")
 
 
-# ===== Bot runner =====
-def run_bot():
-    logger.info("Starting Telegram bot (polling)...")
+# ----- Bot runner (async) -----
+async def run_bot_async():
+    logger.info("Building telegram Application...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # register handlers
-    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("start", cmd_help))
     app.add_handler(CommandHandler("link", cmd_link))
     app.add_handler(CommandHandler("link_cookie", cmd_link_cookie))
     app.add_handler(CommandHandler("unlink", cmd_unlink))
 
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("characters", cmd_characters))
-    app.add_handler(CommandHandler("diary", cmd_diary))
+    app.add_handler(CommandHandler("notes", cmd_notes))
     app.add_handler(CommandHandler("transactions", cmd_transactions))
 
     app.add_handler(CommandHandler("abyss", cmd_abyss))
@@ -388,26 +383,36 @@ def run_bot():
     app.add_handler(CommandHandler("daily", cmd_daily))
     app.add_handler(CommandHandler("check_in", cmd_check_in))
 
-    app.run_polling()
+    logger.info("Starting polling...")
+    # run_polling is a coroutine-friendly blocking call
+    await app.run_polling()
 
 
-# ===== Flask health server =====
+# ----- Flask health server -----
 server = Flask("health_server")
 
 
 @server.route("/", methods=["GET"])
-def home():
+def health():
     return "OK", 200
 
 
-def run_server():
-    logger.info(f"Starting Flask health server on port {PORT}")
+def run_flask():
+    logger.info(f"Starting Flask server on port {PORT}")
+    # Use threaded dev server — fine for Koyeb health-check purpose
     server.run(host="0.0.0.0", port=PORT)
 
 
-# ===== Main =====
+# ----- Main: start Flask thread then asyncio loop for bot -----
+def main():
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    try:
+        asyncio.run(run_bot_async())
+    except Exception:
+        logger.error("Bot crashed:\n" + traceback.format_exc())
+
+
 if __name__ == "__main__":
-    # run bot in thread, Flask in main thread (so Koyeb health check passes)
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-    run_server()
+    main()
