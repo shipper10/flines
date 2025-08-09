@@ -1,341 +1,412 @@
 # bot.py
 import os
 import json
-import asyncio
+import threading
 import traceback
-from typing import Optional, Any, Dict, List
+import logging
+from typing import Any, Dict, List, Optional
 
-import httpx
+from flask import Flask
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
 import genshin
 from dotenv import load_dotenv
 
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+# ===== Logging =====
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("genshin-bot")
+
+# ===== Config =====
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise SystemExit("Please set BOT_TOKEN environment variable")
+    raise SystemExit("Missing BOT_TOKEN environment variable")
 
-API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
+PORT = int(os.environ.get("PORT", 8080))
 DATA_FILE = "users.json"
-POLL_TIMEOUT = 30  # seconds for long polling
 
-# ensure users file exists
+# Ensure users file exists
 if not os.path.exists(DATA_FILE):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump({}, f, ensure_ascii=False, indent=2)
 
-_users_lock = asyncio.Lock()
 
-
-def load_users_sync() -> Dict[str, Dict[str, str]]:
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-async def save_users(users: Dict[str, Dict[str, str]]):
-    async with _users_lock:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(users, f, ensure_ascii=False, indent=2)
-
-
-async def send_message(client: httpx.AsyncClient, chat_id: int, text: str, parse_mode: str = "Markdown"):
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+# ===== Helpers: load/save users =====
+def load_users() -> Dict[str, Dict[str, Any]]:
     try:
-        await client.post(f"{API_URL}/sendMessage", json=payload, timeout=20.0)
-    except Exception as e:
-        print("send_message error:", e)
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 
-async def create_genshin_client(creds: Dict[str, str], uid: Optional[str] = None):
+def save_users(users: Dict[str, Dict[str, Any]]):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(users, f, ensure_ascii=False, indent=2)
+
+
+# ===== Helper: create genshin client (flexible) =====
+def make_genshin_client(creds: Dict[str, Any], uid: Optional[str] = None):
     """
-    Tries to create a genshin.Client using possible cookie shapes.
-    creds may contain: ltuid & ltoken OR cookie_token.
-    Returns a genshin.Client instance or raises.
+    creds may include ltuid+ltoken OR cookie_token.
+    Returns genshin.Client instance (may raise).
     """
     cookies = None
-    if "ltuid" in creds and "ltoken" in creds:
+    if creds.get("ltuid") and creds.get("ltoken"):
         cookies = {"ltuid": creds["ltuid"], "ltoken": creds["ltoken"]}
-    elif "cookie_token" in creds:
+    elif creds.get("cookie_token"):
         cookies = {"cookie_token": creds["cookie_token"]}
     else:
-        raise ValueError("No credentials found")
+        raise ValueError("No credentials stored for this user.")
 
+    # try different constructor patterns
     try:
         if uid:
             return genshin.Client(cookies, uid=int(uid))
         return genshin.Client(cookies)
     except TypeError:
-        # fallback if genshin.Client signature differs
+        # some versions accept kwargs differently
+        try:
+            if uid:
+                return genshin.Client(cookies=cookies, uid=int(uid))
+        except Exception:
+            pass
         return genshin.Client(cookies)
-    except Exception:
-        # re-raise other errors to be handled by caller
-        raise
 
 
-async def try_functions(client_obj: Any, names: List[str], *args, **kwargs):
-    """
-    Attempt calling several coroutine attribute names on client_obj.
-    Returns the first successful result, or raises the last exception.
-    """
+# ===== Helper: try multiple function names on client =====
+async def try_calls(obj: Any, names: List[str], *args, **kwargs):
     last_exc = None
     for name in names:
-        func = getattr(client_obj, name, None)
-        if callable(func):
+        fn = getattr(obj, name, None)
+        if callable(fn):
             try:
-                return await func(*args, **kwargs)
+                return await fn(*args, **kwargs)
+            except TypeError as te:
+                # try without those args (fallback)
+                last_exc = te
+                try:
+                    return await fn()
+                except Exception as e2:
+                    last_exc = e2
+                    continue
             except Exception as e:
                 last_exc = e
                 continue
     if last_exc:
         raise last_exc
-    raise RuntimeError(f"No callable found among: {names}")
+    raise RuntimeError(f"No function found among: {names}")
 
 
-# ---------- Command handlers (simple text-based commands) ----------
-async def handle_start(chat_id: int, client_http: httpx.AsyncClient):
-    text = (
-        "👋 أهلاً! بوت Genshin (بدون python-telegram-bot).\n\n"
-        "الأوامر المدعومة:\n"
-        "/link <ltuid> <ltoken> — ربط الحساب (أو `/link <cookie_token>`)\n"
-        "/setuid <game_uid> — حفظ UID\n"
-        "/resin — عرض Resin\n"
-        "/abyss — عرض Spiral Abyss\n"
-        "/stygian — عرض Stygian Onslaught\n"
-        "/lobby — عرض Theater Lobby\n"
+# ===== Telegram command handlers =====
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "مرحباً! بوت Genshin جاهز ✅\n\n"
+        "الأوامر:\n"
+        "/link <ltuid> <ltoken>  — ربط باستخدام ltuid & ltoken\n"
+        "/link_cookie <cookie_token> — ربط باستخدام cookie_token\n"
+        "/unlink — إلغاء الربط\n\n"
+        "🔹 حساب:\n"
+        "/stats — إحصائيات الحساب\n"
+        "/characters — قائمة الشخصيات\n"
+        "/diary — Traveler's Diary (الملاحظات)\n"
+        "/transactions — آخر المعاملات (إن توفرت)\n\n"
+        "🔹 الأحداث والمعارك:\n"
+        "/abyss — Spiral Abyss الحالي\n"
+        "/previous_abyss — Spiral Abyss السابق (إن دعمته المكتبة)\n\n"
+        "🔹 المكافآت اليومية:\n"
+        "/daily — طلب بيانات المكافآت اليومية (إن توفرت)\n"
+        "/check_in — تحقق/مطالبة يومية (إن دعمت المكتبة)\n"
     )
-    await send_message(client_http, chat_id, text)
 
 
-async def handle_link(chat_id: int, args: List[str], client_http: httpx.AsyncClient):
-    if len(args) == 2:
-        ltuid, ltoken = args
-        users = load_users_sync()
-        users[str(chat_id)] = users.get(str(chat_id), {})
-        users[str(chat_id)]["ltuid"] = ltuid
-        users[str(chat_id)]["ltoken"] = ltoken
-        await save_users(users)
-        await send_message(client_http, chat_id, "✅ تم حفظ ltuid و ltoken بنجاح.")
+async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if len(args) != 2:
+        await update.message.reply_text("❌ الصيغة: /link <ltuid> <ltoken>")
         return
-    elif len(args) == 1:
-        cookie = args[0]
-        users = load_users_sync()
-        users[str(chat_id)] = users.get(str(chat_id), {})
-        users[str(chat_id)]["cookie_token"] = cookie
-        await save_users(users)
-        await send_message(client_http, chat_id, "✅ تم حفظ cookie_token بنجاح.")
-        return
-    else:
-        await send_message(client_http, chat_id, "❌ الصيغة: `/link ltuid ltoken` أو `/link cookie_token`")
+    ltuid, ltoken = args
+    users = load_users()
+    uid_str = str(update.effective_user.id)
+    users.setdefault(uid_str, {})
+    users[uid_str]["ltuid"] = ltuid
+    users[uid_str]["ltoken"] = ltoken
+    save_users(users)
+    await update.message.reply_text("✅ تم حفظ ltuid و ltoken.")
 
 
-async def handle_setuid(chat_id: int, args: List[str], client_http: httpx.AsyncClient):
+async def cmd_link_cookie(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
     if len(args) != 1:
-        await send_message(client_http, chat_id, "❌ الصيغة: `/setuid <game_uid>`")
+        await update.message.reply_text("❌ الصيغة: /link_cookie <cookie_token>")
         return
-    uid = args[0]
-    users = load_users_sync()
-    users[str(chat_id)] = users.get(str(chat_id), {})
-    users[str(chat_id)]["uid"] = uid
-    await save_users(users)
-    await send_message(client_http, chat_id, f"✅ تم حفظ UID: {uid}")
+    cookie = args[0]
+    users = load_users()
+    uid_str = str(update.effective_user.id)
+    users.setdefault(uid_str, {})
+    users[uid_str]["cookie_token"] = cookie
+    save_users(users)
+    await update.message.reply_text("✅ تم حفظ cookie_token.")
 
 
-async def handle_resin(chat_id: int, client_http: httpx.AsyncClient):
-    users = load_users_sync()
-    u = users.get(str(chat_id))
+async def cmd_unlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users = load_users()
+    uid_str = str(update.effective_user.id)
+    if uid_str in users:
+        users.pop(uid_str, None)
+        save_users(users)
+        await update.message.reply_text("✅ تم إلغاء الربط وحذف بياناتك محلياً.")
+    else:
+        await update.message.reply_text("ℹ️ لا يوجد حساب مربوط.")
+
+
+# ---- Account / basic info ----
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users = load_users()
+    uid_str = str(update.effective_user.id)
+    u = users.get(uid_str)
     if not u:
-        await send_message(client_http, chat_id, "⚠️ لم تقم بربط حسابك بعد. استخدم /link")
-        return
-    if "uid" not in u:
-        await send_message(client_http, chat_id, "⚠️ لم تخزن UID بعد. استخدم /setuid <uid>")
+        await update.message.reply_text("⚠️ لم تربط حسابك بعد. استخدم /link أو /link_cookie")
         return
     try:
-        client = await create_genshin_client(u, uid=u.get("uid"))
+        client = make_genshin_client(u, uid=u.get("uid"))
+        # try possible function names for user/stats
+        user = await try_calls(client, ["get_genshin_user", "get_user", "get_user_data"])
+        # extract some common stats
+        stats = getattr(user, "stats", None) or (user.get("stats") if isinstance(user, dict) else None)
+        if stats:
+            ar = getattr(stats, "adventure_rank", None) or stats.get("adventure_rank", None)
+            world_level = getattr(stats, "world_level", None) or stats.get("world_level", None)
+            num_chars = getattr(stats, "character_number", None) or stats.get("character_number", None) or "?"
+            await update.message.reply_text(f"🏷 Adventure Rank: {ar}\n🌍 World Level: {world_level}\n👥 Characters: {num_chars}")
+            return
+        # fallback: try to stringify some fields
+        await update.message.reply_text(str(user))
     except Exception as e:
-        await send_message(client_http, chat_id, f"❌ خطأ بإنشاء عميل genshin: {e}")
-        return
+        tb = traceback.format_exc()
+        logger.error(tb)
+        await update.message.reply_text(f"❌ فشل جلب الإحصائيات: {e}")
 
-    # Try multiple possible function names to get notes/resin
+
+async def cmd_characters(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users = load_users()
+    uid_str = str(update.effective_user.id)
+    u = users.get(uid_str)
+    if not u:
+        await update.message.reply_text("⚠️ لم تربط حسابك بعد.")
+        return
     try:
-        # often: get_notes(uid=...), get_genshin_notes(uid=...)
-        notes = None
-        try:
-            notes = await try_functions(client, ["get_notes", "get_genshin_notes", "get_genshin_user"], uid=u.get("uid"))
-        except TypeError:
-            # fallback to call without uid
-            notes = await try_functions(client, ["get_notes", "get_genshin_notes", "get_genshin_user"])
-        # Extract resin from returned object/dict
-        resin = None
-        if hasattr(notes, "current_resin"):
-            resin = f"{getattr(notes, 'current_resin')}/{getattr(notes, 'max_resin', '?')}"
+        client = make_genshin_client(u, uid=u.get("uid"))
+        data = await try_calls(client, ["get_characters", "get_genshin_user", "get_characters_list"])
+        # try to extract a list of characters
+        chars = None
+        if isinstance(data, dict):
+            chars = data.get("avatars") or data.get("characters") or data.get("data")
         else:
-            # dict-like
-            try:
-                resin = f"{notes.get('current_resin')}/{notes.get('max_resin')}"
-            except Exception:
-                resin = str(notes)
-        await send_message(client_http, chat_id, f"🔋 Resin: {resin}")
+            chars = getattr(data, "avatars", None) or getattr(data, "characters", None)
+        if not chars:
+            await update.message.reply_text("ℹ️ لم أتمكن من استخراج قائمة الشخصيات من المكتبة هذه النسخة.")
+            return
+        lines = []
+        for c in chars[:30]:
+            name = getattr(c, "name", None) or (c.get("name") if isinstance(c, dict) else str(c))
+            level = getattr(c, "level", None) or (c.get("level") if isinstance(c, dict) else "?")
+            lines.append(f"{name} — Lv {level}")
+        await update.message.reply_text("\n".join(lines) if lines else "لا توجد شخصيات.")
     except Exception as e:
-        await send_message(client_http, chat_id, f"❌ لم أتمكن من جلب Resin: {e}")
+        logger.error(traceback.format_exc())
+        await update.message.reply_text(f"❌ خطأ في جلب الشخصيات: {e}")
 
 
-async def handle_abyss(chat_id: int, client_http: httpx.AsyncClient):
-    users = load_users_sync()
-    u = users.get(str(chat_id))
-    if not u or "uid" not in u:
-        await send_message(client_http, chat_id, "⚠️ تأكد من ربط الحساب و حفظ UID (/link و /setuid).")
+async def cmd_diary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users = load_users()
+    uid_str = str(update.effective_user.id)
+    u = users.get(uid_str)
+    if not u:
+        await update.message.reply_text("⚠️ لم تربط حسابك بعد.")
         return
     try:
-        client = await create_genshin_client(u, uid=u.get("uid"))
+        client = make_genshin_client(u, uid=u.get("uid"))
+        notes = await try_calls(client, ["get_notes", "get_genshin_notes", "get_daily_notes"])
+        # attempt to extract useful fields
+        current_resin = getattr(notes, "current_resin", None) or (notes.get("current_resin") if isinstance(notes, dict) else None)
+        max_resin = getattr(notes, "max_resin", None) or (notes.get("max_resin") if isinstance(notes, dict) else None)
+        resin_recovery = getattr(notes, "resin_recovery_time", None) or (notes.get("resin_recovery_time") if isinstance(notes, dict) else None)
+        lines = []
+        if current_resin is not None:
+            lines.append(f"🔋 Resin: {current_resin}/{max_resin}")
+        if resin_recovery:
+            lines.append(f"⏳ Recovery: {resin_recovery}")
+        if lines:
+            await update.message.reply_text("\n".join(lines))
+            return
+        await update.message.reply_text(str(notes))
     except Exception as e:
-        await send_message(client_http, chat_id, f"❌ خطأ بإنشاء عميل genshin: {e}")
-        return
+        logger.error(traceback.format_exc())
+        await update.message.reply_text(f"❌ خطأ في جلب الملاحظات/الـ Diary: {e}")
 
-    candidates = ["get_spiral_abyss", "get_abyss", "spiral_abyss", "get_spiral", "get_abyss_info"]
+
+async def cmd_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users = load_users()
+    uid_str = str(update.effective_user.id)
+    u = users.get(uid_str)
+    if not u:
+        await update.message.reply_text("⚠️ لم تربط حسابك بعد.")
+        return
     try:
-        abyss = None
-        try:
-            abyss = await try_functions(client, candidates, u.get("uid"))
-        except Exception:
-            abyss = await try_functions(client, candidates)
-        # Try to extract some fields
+        client = make_genshin_client(u, uid=u.get("uid"))
+        data = await try_calls(client, ["get_transactions", "get_transaction_history", "get_wallet_records"])
+        # try to show last few entries
+        entries = None
+        if isinstance(data, dict):
+            entries = data.get("transactions") or data.get("items") or data.get("data")
+        else:
+            entries = getattr(data, "transactions", None) or getattr(data, "items", None)
+        if not entries:
+            await update.message.reply_text("ℹ️ لا توجد بيانات معاملات متاحة مع هذه النسخة.")
+            return
+        lines = []
+        for e in entries[:10]:
+            if isinstance(e, dict):
+                kind = e.get("type") or e.get("name") or str(e)
+            else:
+                kind = getattr(e, "type", None) or str(e)
+            lines.append(f"- {kind}")
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        logger.error(traceback.format_exc())
+        await update.message.reply_text(f"❌ خطأ في جلب المعاملات: {e}")
+
+
+# ---- Abyss commands ----
+async def cmd_abyss(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users = load_users()
+    uid_str = str(update.effective_user.id)
+    u = users.get(uid_str)
+    if not u:
+        await update.message.reply_text("⚠️ لم تربط حسابك بعد.")
+        return
+    try:
+        client = make_genshin_client(u, uid=u.get("uid"))
+        abyss = await try_calls(client, ["get_spiral_abyss", "get_abyss", "spiral_abyss"], u.get("uid"))
+        # try to extract main info
         total_stars = getattr(abyss, "total_stars", None) or (abyss.get("total_stars") if isinstance(abyss, dict) else None)
         floors = getattr(abyss, "floors", None) or (abyss.get("floors") if isinstance(abyss, dict) else None)
         lines = []
         if total_stars is not None:
             lines.append(f"⭐ إجمالي النجوم: {total_stars}")
         if floors:
+            # iterate floors
             try:
                 for f in floors:
-                    idx = getattr(f, "index", None) or (f.get("index") if isinstance(f, dict) else None)
-                    stars = getattr(f, "stars", None) or (f.get("stars") if isinstance(f, dict) else None)
+                    idx = getattr(f, "index", None) or (f.get("index") if isinstance(f, dict) else "?")
+                    stars = getattr(f, "stars", None) or (f.get("stars") if isinstance(f, dict) else "?")
                     lines.append(f"🔸 Floor {idx}: {stars}⭐")
             except Exception:
                 lines.append(f"Floors: {len(floors)}")
         if not lines:
             lines = [str(abyss)]
-        await send_message(client_http, chat_id, "\n".join(lines))
+        await update.message.reply_text("\n".join(lines))
     except Exception as e:
-        tb = traceback.format_exc()
-        print(tb)
-        await send_message(client_http, chat_id, f"❌ خطأ جلب Abyss: {e}")
+        logger.error(traceback.format_exc())
+        await update.message.reply_text(f"❌ خطأ في جلب Abyss: {e}")
 
 
-async def handle_stygian(chat_id: int, client_http: httpx.AsyncClient):
-    users = load_users_sync()
-    u = users.get(str(chat_id))
-    if not u or "uid" not in u:
-        await send_message(client_http, chat_id, "⚠️ تأكد من ربط الحساب و حفظ UID (/link و /setuid).")
+async def cmd_prev_abyss(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users = load_users()
+    uid_str = str(update.effective_user.id)
+    u = users.get(uid_str)
+    if not u:
+        await update.message.reply_text("⚠️ لم تربط حسابك بعد.")
         return
     try:
-        client = await create_genshin_client(u, uid=u.get("uid"))
+        client = make_genshin_client(u, uid=u.get("uid"))
+        prev = await try_calls(client, ["get_prev_spiral_abyss", "get_previous_spiral_abyss", "get_spiral_abyss_previous"])
+        await update.message.reply_text(str(prev))
     except Exception as e:
-        await send_message(client_http, chat_id, f"❌ خطأ بإنشاء عميل genshin: {e}")
-        return
-
-    candidates = ["get_stygian_onslaught", "stygian_onslaught", "get_stygian", "stygian"]
-    try:
-        data = None
-        try:
-            data = await try_functions(client, candidates, u.get("uid"))
-        except Exception:
-            data = await try_functions(client, candidates)
-        await send_message(client_http, chat_id, f"⚔️ Stygian Onslaught:\n{data}")
-    except Exception as e:
-        await send_message(client_http, chat_id, f"❌ خطأ جلب Stygian: {e}")
+        logger.error(traceback.format_exc())
+        await update.message.reply_text("ℹ️ لا تدعم مكتبتك هذه الوظيفة أو حدث خطأ عند الاستدعاء.")
 
 
-async def handle_lobby(chat_id: int, client_http: httpx.AsyncClient):
-    users = load_users_sync()
-    u = users.get(str(chat_id))
-    if not u or "uid" not in u:
-        await send_message(client_http, chat_id, "⚠️ تأكد من ربط الحساب و حفظ UID (/link و /setuid).")
+# ---- Daily / check-in (best-effort) ----
+async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔔 أمر /daily: تحقّق من دعم المكتبة. سأحاول جلب بيانات يومية إن كانت متاحة.")
+    users = load_users()
+    uid_str = str(update.effective_user.id)
+    u = users.get(uid_str)
+    if not u:
+        await update.message.reply_text("⚠️ لم تربط حسابك بعد.")
         return
     try:
-        client = await create_genshin_client(u, uid=u.get("uid"))
+        client = make_genshin_client(u, uid=u.get("uid"))
+        daily = await try_calls(client, ["get_daily_rewards", "get_signin_rewards", "get_daily_info"])
+        await update.message.reply_text(str(daily))
     except Exception as e:
-        await send_message(client_http, chat_id, f"❌ خطأ بإنشاء عميل genshin: {e}")
-        return
+        logger.error(traceback.format_exc())
+        await update.message.reply_text("ℹ️ هذه النسخة من المكتبة لا تدعم بيانات المكافآت اليومية.")
 
-    candidates = ["get_theater_lobby", "theater_lobby", "get_lobby", "lobby", "get_theater", "get_home", "home"]
+
+async def cmd_check_in(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⚠️ الأمر /check_in يتم تنفيذه فقط إذا كانت مكتبتك تدعم المطالبة التلقائية — وإلا سيتم إظهار رسالة.")
+    users = load_users()
+    uid_str = str(update.effective_user.id)
+    u = users.get(uid_str)
+    if not u:
+        await update.message.reply_text("⚠️ لم تربط حسابك بعد.")
+        return
     try:
-        data = None
-        try:
-            data = await try_functions(client, candidates, u.get("uid"))
-        except Exception:
-            data = await try_functions(client, candidates)
-        await send_message(client_http, chat_id, f"🎭 Theater Lobby:\n{data}")
+        client = make_genshin_client(u, uid=u.get("uid"))
+        res = await try_calls(client, ["claim_daily_reward", "do_sign_in", "signin"])
+        await update.message.reply_text(f"✅ نتيجة الطلب:\n{res}")
     except Exception as e:
-        await send_message(client_http, chat_id, f"❌ خطأ جلب Lobby: {e}")
+        logger.error(traceback.format_exc())
+        await update.message.reply_text("ℹ️ مكتبتك لا تدعم المطالبة التلقائية أو حدث خطأ.")
 
 
-# ---------- Update polling ----------
-async def handle_update(update: Dict[str, Any], client_http: httpx.AsyncClient):
-    message = update.get("message") or update.get("edited_message") or {}
-    if not message:
-        return
-    chat = message.get("chat", {})
-    chat_id = chat.get("id")
-    text = message.get("text", "") or ""
-    if not text:
-        return
+# ===== Bot runner =====
+def run_bot():
+    logger.info("Starting Telegram bot (polling)...")
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # simple command parse
-    parts = text.strip().split()
-    cmd = parts[0].split("@")[0]  # remove bot username if provided
-    args = parts[1:]
+    # register handlers
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("link", cmd_link))
+    app.add_handler(CommandHandler("link_cookie", cmd_link_cookie))
+    app.add_handler(CommandHandler("unlink", cmd_unlink))
 
-    try:
-        if cmd == "/start":
-            await handle_start(chat_id, client_http)
-        elif cmd == "/link":
-            await handle_link(chat_id, args, client_http)
-        elif cmd == "/setuid":
-            await handle_setuid(chat_id, args, client_http)
-        elif cmd == "/resin":
-            await handle_resin(chat_id, client_http)
-        elif cmd == "/abyss":
-            await handle_abyss(chat_id, client_http)
-        elif cmd == "/stygian":
-            await handle_stygian(chat_id, client_http)
-        elif cmd == "/lobby":
-            await handle_lobby(chat_id, client_http)
-        else:
-            # ignore other messages
-            pass
-    except Exception as e:
-        tb = traceback.format_exc()
-        print("handler error:", tb)
-        await send_message(client_http, chat_id, f"❌ خطأ داخلي: {e}")
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("characters", cmd_characters))
+    app.add_handler(CommandHandler("diary", cmd_diary))
+    app.add_handler(CommandHandler("transactions", cmd_transactions))
+
+    app.add_handler(CommandHandler("abyss", cmd_abyss))
+    app.add_handler(CommandHandler("previous_abyss", cmd_prev_abyss))
+
+    app.add_handler(CommandHandler("daily", cmd_daily))
+    app.add_handler(CommandHandler("check_in", cmd_check_in))
+
+    app.run_polling()
 
 
-async def poll_updates():
-    offset = None
-    async with httpx.AsyncClient(timeout=POLL_TIMEOUT + 10) as client_http:
-        while True:
-            try:
-                params = {"timeout": POLL_TIMEOUT}
-                if offset:
-                    params["offset"] = offset
-                resp = await client_http.get(f"{API_URL}/getUpdates", params=params)
-                j = resp.json()
-                if not j.get("ok"):
-                    print("getUpdates failed:", j)
-                    await asyncio.sleep(2)
-                    continue
-                results = j.get("result", []) or []
-                for upd in results:
-                    offset = upd["update_id"] + 1
-                    # handle each update concurrently but not blocking the poll loop
-                    asyncio.create_task(handle_update(upd, client_http))
-            except Exception as e:
-                print("polling error:", e)
-                await asyncio.sleep(3)
+# ===== Flask health server =====
+server = Flask("health_server")
 
 
-def main():
-    print("Starting long-polling Telegram bot...")
-    asyncio.run(poll_updates())
+@server.route("/", methods=["GET"])
+def home():
+    return "OK", 200
 
 
+def run_server():
+    logger.info(f"Starting Flask health server on port {PORT}")
+    server.run(host="0.0.0.0", port=PORT)
+
+
+# ===== Main =====
 if __name__ == "__main__":
-    main()
+    # run bot in thread, Flask in main thread (so Koyeb health check passes)
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+    run_server()
